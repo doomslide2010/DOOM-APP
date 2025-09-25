@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Vega AI • DOOM APP</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="manifest" href="/manifest.json">
+  <script>if("serviceWorker" in navigator){navigator.serviceWorker.register("/service-worker.js");}</script>
+</head>
+<body>
+  <div class="app">
+    <aside class="leftbar">
+      <div class="brand">DOOM • Vega AI</div>
+      <div id="dmList" class="dm-list"></div>
+      <hr>
+      <div id="channels" class="channels"></div>
+      <button id="newChannelBtn">+ Canal</button>
+    </aside>
+
+    <main class="main">
+      <header class="header">
+        <div>
+          <div id="chatTitle">Selecciona canal</div>
+          <div id="chatSubtitle">#</div>
+        </div>
+        <div>
+          <button id="aiBtn">🤖 Vega AI</button>
+          <button id="optionsBtn">⋮</button>
+        </div>
+      </header>
+
+      <section class="chat">
+        <div id="messages" class="messages"></div>
+        <div class="composer">
+          <input id="msgInput" placeholder="Escribe un mensaje..." />
+          <input type="file" id="fileInput" style="display:none" />
+          <button id="attachBtn">📎</button>
+          <button id="recordBtn">🎤</button>
+          <button id="sendBtn">Enviar</button>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

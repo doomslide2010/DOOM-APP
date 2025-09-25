@@ -1,0 +1,506 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# paid - Script final DOOM-APP / Vega AI (instalador completo y generador de proyecto)
+# Ubicación: ~/DOOM-APP/paid
+set -euo pipefail
+
+APP_DIR="$HOME/DOOM-APP"
+PUBLIC_DIR="$APP_DIR/public"
+
+echo "🚀 paid — setup completo iniciando en $APP_DIR"
+
+# Crear estructura
+mkdir -p "$APP_DIR"
+mkdir -p "$PUBLIC_DIR"
+cd "$APP_DIR"
+
+# -------------------------
+# package.json
+# -------------------------
+cat > package.json <<'JSON'
+{
+  "name": "doom-vegai-paid",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  }
+}
+JSON
+
+# -------------------------
+# Instalar dependencias
+# -------------------------
+echo "📦 Instalando dependencias npm (esto puede tardar)..."
+# Lista de paquetes pensada para Termux/Android. --no-audit --no-fund para reducir ruido.
+npm install express dotenv cors node-fetch lowdb socket.io multer bcryptjs express-session passport passport-google-oauth20 gtts nodemon crypto-js simple-peer --no-audit --no-fund
+
+# -------------------------
+# .env (no sobrescribe si existe)
+# -------------------------
+if [ ! -f ".env" ]; then
+  cat > .env <<'ENV'
+PORT=4000
+SESSION_SECRET=pon_un_secreto_largo_aqui
+GEMINI_API_KEY=PUT_YOUR_GEMINI_KEY_HERE
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+GOOGLE_CALLBACK=http://localhost:4000/auth/google/callback
+CORS_ORIGIN=http://localhost:4000
+ENCRYPT_DB_PASSWORD=
+ENV
+  echo "🔑 .env creado. Edita .env y coloca tu GEMINI_API_KEY (y GOOGLE_* si quieres)."
+else
+  echo "ℹ .env ya existe — no se sobrescribe"
+fi
+
+# -------------------------
+# db.json (estructura inicial)
+# -------------------------
+cat > db.json <<'JSON'
+{
+  "users": [],
+  "servers": [],
+  "channels": [],
+  "messages": [],
+  "roles": []
+}
+JSON
+
+# -------------------------
+# db.js (lowdb helpers + opcional cifrado sencillo)
+# -------------------------
+cat > db.js <<'JS'
+import { Low } from 'lowdb'
+import { JSONFile } from 'lowdb/node'
+import fs from 'fs'
+import CryptoJS from 'crypto-js'
+
+const FILE = './db.json'
+const adapter = new JSONFile(FILE)
+const db = new Low(adapter)
+
+async function init(){
+  await db.read()
+  db.data ||= { users: [], servers: [], channels: [], messages: [], roles: [] }
+}
+await init()
+
+export async function save() {
+  await db.write()
+  // simple optional encryption: if ENCRYPT_DB_PASSWORD present, overwrite db.json encrypted
+  if (process.env.ENCRYPT_DB_PASSWORD) {
+    const raw = fs.readFileSync(FILE, 'utf8')
+    const cipher = CryptoJS.AES.encrypt(raw, process.env.ENCRYPT_DB_PASSWORD).toString()
+    fs.writeFileSync(FILE, JSON.stringify({ __encrypted: true, data: cipher }))
+  }
+}
+
+// Basic helpers
+export async function addUser(u){ u.id = u.id || Date.now().toString(); db.data.users.push(u); await save(); return u }
+export async function findUserByUsername(username){ await db.read(); return db.data.users.find(x=>x.username===username) || null }
+export async function findUserByEmail(email){ await db.read(); return db.data.users.find(x=>x.email===email) || null }
+export async function updateUser(id, patch){ await db.read(); const user = db.data.users.find(u=>u.id===id); if(!user) return null; Object.assign(user,patch); await save(); return user }
+
+export async function addServer(s){ s.id = s.id || Date.now().toString(); s.createdAt = new Date().toISOString(); db.data.servers.push(s); await save(); return s }
+export async function listServers(){ await db.read(); return db.data.servers }
+
+export async function addChannel(c){ c.id = c.id || Date.now().toString(); db.data.channels.push(c); await save(); return c }
+export async function listChannels(serverId){ await db.read(); return db.data.channels.filter(ch=>ch.serverId===serverId) }
+
+export async function addMessage(m){
+  m.id = Date.now().toString()
+  m.createdAt = new Date().toISOString()
+  m.edited = false
+  m.reactions = {}
+  m.pinned = false
+  db.data.messages.push(m)
+  await save()
+  return m
+}
+export async function editMessage(id, patch){
+  await db.read()
+  const msg = db.data.messages.find(x=>x.id===id)
+  if(!msg) return null
+  Object.assign(msg, patch)
+  msg.edited = true
+  await save()
+  return msg
+}
+export async function delMessage(id){
+  await db.read()
+  const idx = db.data.messages.findIndex(x=>x.id===id)
+  if(idx>=0){ db.data.messages.splice(idx,1); await save(); return true }
+  return false
+}
+export async function getMessages(channelId, limit=200, before=null){
+  await db.read()
+  let msgs = db.data.messages.filter(m=>m.channelId===channelId)
+  msgs.sort((a,b)=> new Date(a.createdAt) - new Date(b.createdAt))
+  if (before) msgs = msgs.filter(m => new Date(m.createdAt) < new Date(before))
+  if (limit) msgs = msgs.slice(-limit)
+  return msgs
+}
+
+export default db
+JS
+
+# -------------------------
+# vega_ai.js (wrapper Gemini + TTS simple)
+# -------------------------
+cat > vega_ai.js <<'JS'
+import fetch from 'node-fetch'
+import fs from 'fs'
+import path from 'path'
+import gTTS from 'gtts'
+
+const KEY = process.env.GEMINI_API_KEY
+
+export async function askGemini(prompt){
+  if(!KEY) return "Gemini API key no configurada."
+  const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key="+KEY
+  try{
+    const r = await fetch(url, { method:'POST', headers:{ 'Content-Type':'application/json' }, body: JSON.stringify({ contents:[{ parts:[{ text: prompt }] }] }) })
+    const j = await r.json()
+    return j.candidates?.[0]?.content?.parts?.[0]?.text || "No obtuve respuesta."
+  }catch(e){
+    console.error("Gemini error",e); return "Error en Gemini."
+  }
+}
+
+export async function ttsSave(text){
+  const outdir = path.join('public')
+  if(!fs.existsSync(outdir)) fs.mkdirSync(outdir, { recursive:true })
+  const out = path.join(outdir, 'tts_'+Date.now()+'.mp3')
+  await new Promise((res,rej)=> new gTTS(text,'es').save(out, err=> err?rej(err):res()))
+  return '/'+out
+}
+JS
+
+# -------------------------
+# server.js (backend completo)
+# -------------------------
+cat > server.js <<'JS'
+import express from 'express'
+import http from 'http'
+import { Server as IOServer } from 'socket.io'
+import dotenv from 'dotenv'
+import cors from 'cors'
+import session from 'express-session'
+import bcrypt from 'bcryptjs'
+import multer from 'multer'
+import path from 'path'
+import fs from 'fs'
+
+import * as DB from './db.js'
+import { askGemini, ttsSave } from './vega_ai.js'
+
+dotenv.config()
+const app = express()
+const server = http.createServer(app)
+const io = new IOServer(server, { cors: { origin: process.env.CORS_ORIGIN || true, methods:['GET','POST'] } })
+
+app.use(cors({ origin: process.env.CORS_ORIGIN || true, credentials:true }))
+app.use(express.json({ limit:'12mb' }))
+app.use(express.urlencoded({ extended:true }))
+app.use(session({ secret: process.env.SESSION_SECRET || 'secret', resave:false, saveUninitialized:false }))
+
+const PUBLIC = path.join(process.cwd(),'public')
+const UP = path.join(process.cwd(),'uploads')
+if(!fs.existsSync(UP)) fs.mkdirSync(UP,{ recursive:true })
+app.use('/uploads', express.static(UP))
+app.use(express.static(PUBLIC))
+
+const storage = multer.diskStorage({
+  destination: (req,file,cb)=> cb(null, UP),
+  filename: (req,file,cb)=> cb(null, Date.now()+'_'+file.originalname.replace(/\s+/g,'_'))
+})
+const upload = multer({ storage, limits: { fileSize: 40*1024*1024 } })
+
+// ---------- AUTH ----------
+app.post('/api/register', async (req,res)=>{
+  const { username,email,password,name } = req.body
+  if(!username||!email||!password) return res.status(400).json({ error:'missing' })
+  if(await DB.findUserByUsername(username)) return res.status(400).json({ error:'username_exists' })
+  if(await DB.findUserByEmail(email)) return res.status(400).json({ error:'email_exists' })
+  const hash = await bcrypt.hash(password,10)
+  const user = { id: Date.now().toString(), username, email, name:name||username, passwordHash: hash, avatar:null, createdAt: new Date().toISOString() }
+  await DB.addUser(user)
+  req.session.user = { id: user.id, username: user.username }
+  res.json({ ok:true, user })
+})
+
+app.post('/api/login', async (req,res)=>{
+  const { username,password } = req.body
+  const user = await DB.findUserByUsername(username)
+  if(!user) return res.status(400).json({ error:'no_user' })
+  const ok = await bcrypt.compare(password, user.passwordHash || '')
+  if(!ok) return res.status(400).json({ error:'invalid' })
+  req.session.user = { id: user.id, username: user.username }
+  res.json({ ok:true, user })
+})
+
+app.post('/api/logout',(req,res)=>{ req.session.destroy(()=>res.json({ ok:true })) })
+app.get('/api/me',(req,res)=> res.json({ user: req.session.user || null }) )
+
+// ---------- UPLOADS ----------
+app.post('/api/upload', upload.single('file'), (req,res)=> {
+  if(!req.file) return res.status(400).json({ error:'nofile' })
+  res.json({ ok:true, url: '/uploads/' + path.basename(req.file.path) })
+})
+
+// ---------- SERVERS / CHANNELS ----------
+app.post('/api/servers', async (req,res)=> {
+  const s = await DB.addServer({ name: req.body.name, owner: req.session.user?.username || 'anon', icon: req.body.icon||null })
+  res.json({ ok:true, server: s })
+})
+app.get('/api/servers', async (req,res)=> res.json(await DB.listServers()))
+
+app.post('/api/servers/:id/channels', async (req,res)=>{
+  const ch = await DB.addChannel({ serverId: req.params.id, name: req.body.name, type: req.body.type||'text', theme: 'oscuro' })
+  res.json({ ok:true, channel: ch })
+})
+app.get('/api/servers/:id/channels', async (req,res)=> res.json(await DB.listChannels(req.params.id)))
+
+// ---------- MESSAGES ----------
+app.post('/api/channels/:id/messages', upload.single('file'), async (req,res)=>{
+  const channelId = req.params.id
+  const from = req.session.user?.username || req.body.from || 'anon'
+  let content = req.body.text || ''
+  let type = req.body.type || 'text'
+  if(req.file){
+    content = '/uploads/' + path.basename(req.file.path)
+    type = req.file.mimetype.startsWith('image/') ? 'image' : 'file'
+  }
+  const msg = await DB.addMessage({ channelId, from, text: content, type })
+  io.to('channel_'+channelId).emit('message', msg)
+  res.json({ ok:true, message: msg })
+})
+
+app.get('/api/channels/:id/messages', async (req,res)=> {
+  const msgs = await DB.getMessages(req.params.id, 200, req.query.before || null)
+  res.json(msgs)
+})
+
+// edit/delete/react/pin
+app.post('/api/messages/:id/edit', async (req,res)=>{
+  const id = req.params.id; const { text } = req.body
+  const msg = await DB.editMessage(id, { text })
+  res.json({ ok:true, message: msg })
+})
+app.post('/api/messages/:id/delete', async (req,res)=>{
+  const ok = await DB.delMessage(req.params.id)
+  res.json({ ok })
+})
+app.post('/api/messages/:id/react', async (req,res)=>{
+  const { emoji, user } = req.body
+  await DB.read?.()
+  const m = (await import('./db.js')).default.data.messages.find(x=>x.id===req.params.id)
+  if(!m) return res.status(404).json({ error:'no_msg' })
+  m.reactions = m.reactions || {}
+  m.reactions[emoji] = m.reactions[emoji] || []
+  if(!m.reactions[emoji].includes(user)) m.reactions[emoji].push(user)
+  await (await import('./db.js')).default.write?.()
+  res.json({ ok:true, reactions: m.reactions })
+})
+app.post('/api/messages/:id/pin', async (req,res)=>{
+  const { pin } = req.body
+  await DB.editMessage(req.params.id, { pinned: pin })
+  res.json({ ok:true })
+})
+
+// --- GEMINI & TTS ---
+app.post('/api/gemini', async (req,res)=>{
+  try{
+    const prompt = String(req.body.message || '')
+    if(!prompt) return res.json({ reply: '' })
+    const answer = await askGemini(prompt)
+    res.json({ reply: answer })
+  }catch(e){ console.error(e); res.status(500).json({ reply:'error' }) }
+})
+app.post('/api/gemini/audio', async (req,res)=>{
+  try{
+    const text = String(req.body.message || '')
+    const file = await ttsSave(text)
+    res.json({ url: file })
+  }catch(e){ console.error(e); res.status(500).json({ error:'tts_error' }) }
+})
+
+// --- SYNC (hybrid) ---
+app.get('/api/sync/channel/:id/recent', async (req,res)=>{
+  const msgs = await DB.getMessages(req.params.id, 200)
+  res.json({ messages: msgs })
+})
+
+// --- JITSI fallback (embed link)
+app.get('/api/jitsi/:room', (req,res)=>{
+  res.json({ url: `https://meet.jit.si/${encodeURIComponent(req.params.room)}` })
+})
+
+// --- SOCKET.IO real-time & signaling ---
+io.on('connection', socket=>{
+  socket.on('joinChannel', channelId=>{
+    socket.join('channel_'+channelId)
+  })
+  socket.on('leaveChannel', channelId=>{
+    socket.leave('channel_'+channelId)
+  })
+  socket.on('message', async data=>{
+    const msg = await DB.addMessage({ channelId: data.channelId, from: data.from, text: data.text, type: data.type||'text' })
+    io.to('channel_'+data.channelId).emit('message', msg)
+  })
+  socket.on('webrtc-offer', p=> socket.to(p.room).emit('webrtc-offer', p))
+  socket.on('webrtc-answer', p=> socket.to(p.room).emit('webrtc-answer', p))
+  socket.on('webrtc-ice', p=> socket.to(p.room).emit('webrtc-ice', p))
+})
+
+const PORT = process.env.PORT || 4000
+server.listen(PORT, ()=> console.log('✅ Vega AI server corriendo en http://localhost:'+PORT))
+JS
+
+# -------------------------
+# Frontend: index.html, style.css, app.js
+# -------------------------
+cat > "$PUBLIC_DIR/index.html" <<'HTML'
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Vega AI — DOOM APP (paid)</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="leftbar">
+    <div class="brand">DOOM • Vega AI</div>
+    <div id="serverList" class="server-list"></div>
+    <button id="createServerBtn" title="Crear servidor">+ Servidor</button>
+  </aside>
+
+  <aside class="sidebar">
+    <div id="serverHeader">Seleccione servidor</div>
+    <div id="channelList" class="channel-list"></div>
+    <button id="createChannelBtn" title="Crear canal">+ Canal</button>
+  </aside>
+
+  <main class="main">
+    <header class="chat-header">
+      <div>
+        <div id="chatTitle">Selecciona canal</div>
+        <div id="chatSubtitle">#</div>
+      </div>
+      <div>
+        <button id="menuBtn" class="menu-btn">⋮</button>
+      </div>
+    </header>
+
+    <section class="chat-area">
+      <div id="messages" class="messages"></div>
+      <div class="composer">
+        <input id="msgInput" placeholder="Escribe un mensaje..." />
+        <input type="file" id="fileInput" style="display:none" />
+        <button id="attachBtn">📎</button>
+        <button id="sendBtn">Enviar</button>
+        <button id="voiceBtn" title="Unirse a la sala de voz">🔊</button>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- Settings modal -->
+<div id="settingsModal" class="modal"><div class="modal-body">
+  <span class="close" onclick="closeSettings()">&times;</span>
+  <h3>Ajustes</h3>
+  <label>Nombre: <input id="contactName" /></label>
+  <label>Notificaciones:
+    <select id="notifSelect"><option value="sonido">Sonido</option><option value="vibracion">Vibración</option><option value="silencio">Silencio</option></select>
+  </label>
+  <label>Tema:
+    <select id="themeSelect"><option value="oscuro">Oscuro</option><option value="claro">Claro</option><option value="montanas">Montañas</option><option value="playa">Playa</option><option value="corazones">Corazones</option></select>
+  </label>
+  <button id="saveSettingsBtn">Guardar</button>
+</div></div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
+HTML
+
+cat > "$PUBLIC_DIR/style.css" <<'CSS'
+:root{--bg:#050507;--panel:#0b0f10;--accent:#00ff99;--muted:#9aa}
+*{box-sizing:border-box;margin:0;padding:0}
+body{height:100vh;font-family:Inter,Arial;background:linear-gradient(180deg,#000,#071218);color:var(--muted);display:flex}
+.app{display:flex;flex:1;height:100vh}
+.leftbar{width:72px;background:#071018;padding:10px;display:flex;flex-direction:column;align-items:center}
+.brand{writing-mode:vertical-rl;transform:rotate(180deg);color:var(--accent);font-weight:700;margin-bottom:12px}
+.server-list{flex:1;display:flex;flex-direction:column;gap:8px;width:100%}
+.server-list button{background:#081418;border:none;color:var(--muted);padding:8px;border-radius:8px;cursor:pointer}
+.sidebar{width:220px;background:#071018;padding:12px;border-left:1px solid rgba(255,255,255,0.02)}
+.channel-list{margin-top:10px;display:flex;flex-direction:column;gap:6px}
+.channel-list .ch{padding:8px;border-radius:6px;background:rgba(255,255,255,0.02);cursor:pointer}
+.main{flex:1;display:flex;flex-direction:column}
+.chat-header{display:flex;justify-content:space-between;align-items:center;padding:12px;background:rgba(255,255,255,0.02);border-bottom:1px solid rgba(255,255,255,0.02)}
+.chat-area{display:flex;flex-direction:column;flex:1;padding:12px}
+.messages{flex:1;overflow:auto;padding:10px;display:flex;flex-direction:column;gap:10px;scroll-behavior:smooth}
+.msg{max-width:70%;padding:10px;border-radius:12px;opacity:0;transform:translateY(8px);animation:pop .18s forwards;position:relative}
+.msg.me{align-self:flex-end;background:linear-gradient(90deg,#00e6a8,#00bfa5);color:#001}
+.msg.other{align-self:flex-start;background:rgba(255,255,255,0.04)}
+.msg .meta{font-size:11px;color:rgba(255,255,255,0.5);margin-bottom:6px}
+.msg .reactions{position:absolute;bottom:-18px;left:4px;display:flex;gap:6px}
+.reaction{background:rgba(0,0,0,0.3);padding:2px 6px;border-radius:10px;font-size:12px;cursor:pointer}
+.pin{position:absolute;top:-10px;right:6px;font-size:12px;color:#ffd700}
+@keyframes pop{to{opacity:1;transform:none}}
+.composer{display:flex;gap:8px;padding-top:8px}
+.composer input{flex:1;padding:10px;border-radius:10px;border:1px solid rgba(255,255,255,0.03);background:rgba(0,0,0,0.4);color:var(--muted)}
+.composer button{padding:8px 12px;border-radius:8px;border:none;background:var(--accent);color:#001;cursor:pointer}
+.modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);align-items:center;justify-content:center}
+.modal .modal-body{background:#0b0f10;padding:18px;border-radius:10px;color:var(--muted);min-width:320px}
+.close{float:right;cursor:pointer;color:#ff6b6b}
+CSS
+
+cat > "$PUBLIC_DIR/app.js" <<'JS'
+const API = '/api'
+const socket = io()
+let servers = []
+let channels = []
+let currentServer = null
+let currentChannel = null
+let me = localStorage.getItem('vega_local_user') || ('u_'+Date.now())
+localStorage.setItem('vega_local_user', me)
+
+const serverList = document.getElementById('serverList')
+const channelList = document.getElementById('channelList')
+const messagesEl = document.getElementById('messages')
+const chatTitle = document.getElementById('chatTitle')
+const chatSubtitle = document.getElementById('chatSubtitle')
+
+async function init(){
+  await loadServers()
+  bindUI()
+  loadLocalCache()
+  requestNotificationPermission()
+}
+function bindUI(){
+  document.getElementById('createServerBtn').onclick = async ()=>{
+    const name = prompt('Nombre del servidor:')
+    if(!name) return
+    await fetch(API+'/servers',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name})})
+    await loadServers()
+  }
+  document.getElementById('createChannelBtn').onclick = async ()=>{
+    if(!currentServer) return alert('Selecciona servidor')
+    const name = prompt('Nombre del canal:')
+    if(!name) return
+    await fetch(API+`/servers/${currentServer.id}/channels`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name,type:'text'})})
+    await loadChannels(currentServer.id)
+  }
+  document.getElementById('attachBtn').addEventListener('click', ()=> document.getElementById('fileInput').click())
+  document.getElementById('fileInput').addEventListener('change', async e=>{
+    const f = e.target.files[0]; if(!f) return
+    const fd = new FormData(); fd.append('file',f)
+    await fetch(API+`/channels/${currentChannel.id}/messages`,{method:'POST',body:fd})
+  })
+  document.getElementById('sendBtn').onclick = sendComposer
+  document.getElementById('msgInput').addEventListener('keypress', e=>{ if(e.key==='Enter') sendComposer() }

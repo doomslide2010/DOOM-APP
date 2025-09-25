@@ -1,0 +1,464 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# logger - instalador todo-en-uno para DOOM-APP / Vega AI
+# Crea backend + frontend (canales tipo Discord + chat 1:1 WhatsApp-like + Gemini)
+set -euo pipefail
+
+APP_DIR="$HOME/DOOM-APP"
+PUBLIC_DIR="$APP_DIR/public"
+
+echo "🚀 logger — iniciando setup en $APP_DIR"
+
+mkdir -p "$APP_DIR"
+mkdir -p "$PUBLIC_DIR"
+cd "$APP_DIR"
+
+# package.json (ES module for top-level await)
+cat > package.json <<'JSON'
+{
+  "name": "doom-vegai-logger",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  }
+}
+JSON
+
+echo "📦 Instalando dependencias (express, socket.io, lowdb, nodemon, node-fetch, dotenv)..."
+npm install express socket.io lowdb nodemon node-fetch dotenv cors multer gtts crypto-js bcryptjs express-session --no-audit --no-fund
+
+# .env (no sobrescribe)
+if [ ! -f ".env" ]; then
+cat > .env <<'ENV'
+PORT=4000
+GEMINI_API_KEY=PUT_YOUR_GEMINI_KEY_HERE
+SESSION_SECRET=pon_un_secreto_largo_aqui
+CORS_ORIGIN=http://localhost:4000
+ENV
+echo "🔑 .env creado — edítalo con tu GEMINI_API_KEY"
+else
+echo "ℹ .env ya existe — no se sobrescribe"
+fi
+
+# db.json default
+if [ ! -f "db.json" ]; then
+cat > db.json <<'JSON'
+{
+  "channels": {
+    "general": []
+  },
+  "users": []
+}
+JSON
+fi
+
+# db.js (lowdb helpers)
+cat > db.js <<'JS'
+import { Low } from "lowdb"
+import { JSONFile } from "lowdb/node"
+
+const adapter = new JSONFile("db.json")
+const db = new Low(adapter)
+
+await db.read()
+db.data ||= { channels: { general: [] }, users: [] }
+await db.write()
+
+export default db
+JS
+
+# vega_ai.js (Gemini wrapper + simple TTS)
+cat > vega_ai.js <<'JS'
+import fetch from 'node-fetch'
+import gTTS from 'gtts'
+import fs from 'fs'
+import path from 'path'
+const KEY = process.env.GEMINI_API_KEY || ''
+
+export async function askGemini(prompt){
+  if(!KEY) return "⚠️ Gemini API key no configurada."
+  const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key="+KEY
+  try{
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type":"application/json" },
+      body: JSON.stringify({ contents:[{ parts:[{ text: prompt }] }] })
+    })
+    const j = await resp.json()
+    return j.candidates?.[0]?.content?.parts?.[0]?.text || "No hubo respuesta."
+  }catch(e){
+    console.error("Gemini error:", e)
+    return "Error al contactar Gemini."
+  }
+}
+
+export async function ttsSave(text){
+  const outdir = path.join(process.cwd(),'public','tts')
+  if(!fs.existsSync(outdir)) fs.mkdirSync(outdir, { recursive: true })
+  const out = path.join(outdir, 'tts_'+Date.now()+'.mp3')
+  await new Promise((res,rej)=> new gTTS(text,'es').save(out, err=> err?rej(err):res()))
+  return '/tts/'+path.basename(out)
+}
+JS
+
+# server.js (backend + sockets + endpoints)
+cat > server.js <<'JS'
+import express from 'express'
+import http from 'http'
+import { Server } from 'socket.io'
+import dotenv from 'dotenv'
+import cors from 'cors'
+import multer from 'multer'
+import path from 'path'
+import fs from 'fs'
+
+import db from './db.js'
+import { askGemini, ttsSave } from './vega_ai.js'
+
+dotenv.config()
+const app = express()
+const server = http.createServer(app)
+const io = new Server(server, { cors: { origin: process.env.CORS_ORIGIN || true, methods:['GET','POST'] } })
+
+app.use(cors({ origin: process.env.CORS_ORIGIN || true }))
+app.use(express.json({ limit: '12mb' }))
+app.use(express.urlencoded({ extended: true }))
+app.use(express.static('public'))
+
+// uploads
+const UP = path.join(process.cwd(),'uploads')
+if(!fs.existsSync(UP)) fs.mkdirSync(UP,{ recursive: true })
+app.use('/uploads', express.static(UP))
+
+const storage = multer.diskStorage({
+  destination: (req,file,cb)=> cb(null, UP),
+  filename: (req,file,cb)=> cb(null, Date.now()+'_'+file.originalname.replace(/\s+/g,'_'))
+})
+const upload = multer({ storage, limits: { fileSize: 40*1024*1024 } })
+
+// REST: list channels
+app.get('/api/channels', async (req,res)=>{
+  await db.read()
+  res.json(Object.keys(db.data.channels))
+})
+
+// REST: create channel (with category & permissions)
+app.post('/api/channels', async (req,res)=>{
+  const { name, category='General', permissions=[] } = req.body
+  await db.read()
+  if(!db.data.channels[name]) db.data.channels[name]=[]
+  await db.write()
+  res.json({ ok:true, channel: name })
+})
+
+// messages per channel (POST to send with optional file)
+app.post('/api/channels/:channel/messages', upload.single('file'), async (req,res)=>{
+  const channel = req.params.channel
+  await db.read()
+  if(!db.data.channels[channel]) db.data.channels[channel]=[]
+  let type = 'text'
+  let content = req.body.text || ''
+  if(req.file){
+    content = '/uploads/'+path.basename(req.file.path)
+    if(req.file.mimetype.startsWith('image/')) type='image'
+    else if(req.file.mimetype.startsWith('audio/')) type='audio'
+    else type='file'
+  }
+  const msg = { id: Date.now().toString(), channel, text: content, type, from: req.body.from || 'anon', createdAt: new Date().toISOString(), edited:false, reactions:{}, pinned:false }
+  db.data.channels[channel].push(msg)
+  await db.write()
+  io.to(channel).emit('message', msg)
+  res.json({ ok:true, message: msg })
+})
+
+// get messages
+app.get('/api/channels/:channel/messages', async (req,res)=>{
+  const channel = req.params.channel
+  await db.read()
+  res.json(db.data.channels[channel] || [])
+})
+
+// Gemini text endpoint
+app.post('/api/gemini', async (req,res)=>{
+  const prompt = String(req.body.message || '')
+  const reply = await askGemini(prompt)
+  res.json({ reply })
+})
+
+// Gemini TTS
+app.post('/api/gemini/tts', async (req,res)=>{
+  const text = String(req.body.message || '')
+  const url = await ttsSave(text)
+  res.json({ url })
+})
+
+// Socket.IO: channel join, send, history
+io.on('connection', socket=>{
+  socket.on('join', async (channel)=>{
+    socket.join(channel)
+    await db.read()
+    const history = db.data.channels[channel] || []
+    socket.emit('history', { channel, history })
+  })
+  socket.on('send', async (data)=>{
+    // data: { channel, text, from, type }
+    await db.read()
+    if(!db.data.channels[data.channel]) db.data.channels[data.channel] = []
+    const msg = { id: Date.now().toString(), channel: data.channel, text: data.text, type: data.type||'text', from: data.from||'anon', createdAt: new Date().toISOString(), edited:false, reactions:{}, pinned:false }
+    db.data.channels[data.channel].push(msg)
+    await db.write()
+    io.to(data.channel).emit('message', msg)
+  })
+})
+
+const PORT = process.env.PORT || 4000
+server.listen(PORT, '0.0.0.0', ()=> console.log('✅ Vega AI server corriendo en http://localhost:'+PORT))
+JS
+
+# public/index.html (UI hybrid: sidebar channels + WhatsApp-like chat)
+cat > "$PUBLIC_DIR/index.html" <<'HTML'
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Vega AI • DOOM APP</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="leftbar">
+      <div class="brand">DOOM • Vega AI</div>
+      <div id="dmList" class="dm-list"></div>
+      <hr>
+      <div id="channels" class="channels"></div>
+      <button id="newChannelBtn">+ Canal</button>
+    </aside>
+
+    <main class="main">
+      <header class="header">
+        <div>
+          <div id="chatTitle">Selecciona canal</div>
+          <div id="chatSubtitle">#</div>
+        </div>
+        <div>
+          <button id="aiBtn">🤖 Vega AI</button>
+          <button id="optionsBtn">⋮</button>
+        </div>
+      </header>
+
+      <section class="chat">
+        <div id="messages" class="messages"></div>
+        <div class="composer">
+          <input id="msgInput" placeholder="Escribe un mensaje..." />
+          <input type="file" id="fileInput" style="display:none" />
+          <button id="attachBtn">📎</button>
+          <button id="recordBtn">🎤</button>
+          <button id="sendBtn">Enviar</button>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
+HTML
+
+# public/style.css (dark theme + WhatsApp-like bubbles)
+cat > "$PUBLIC_DIR/style.css" <<'CSS'
+:root{--bg:#070707;--panel:#0b0f10;--accent:#00ff88;--muted:#99a}
+*{box-sizing:border-box;margin:0;padding:0;font-family:Inter,Arial,Helvetica}
+body{height:100vh;background:linear-gradient(180deg,#000,#071218);color:var(--muted);display:flex}
+.app{display:flex;flex:1;height:100vh}
+.leftbar{width:84px;background:#071018;padding:12px;display:flex;flex-direction:column;align-items:center}
+.brand{writing-mode:vertical-rl;transform:rotate(180deg);color:var(--accent);font-weight:800;margin-bottom:12px}
+.channels{width:100%}
+.channels .chan{padding:8px;border-radius:8px;margin:6px 0;background:rgba(255,255,255,0.03);cursor:pointer;text-align:center}
+.leftbar button{margin-top:10px;padding:6px 8px;border-radius:8px;background:transparent;border:1px solid rgba(255,255,255,0.04);color:var(--muted);cursor:pointer}
+.main{flex:1;display:flex;flex-direction:column}
+.header{display:flex;justify-content:space-between;align-items:center;padding:12px;background:rgba(255,255,255,0.02);border-bottom:1px solid rgba(255,255,255,0.02)}
+.chat{display:flex;flex-direction:column;flex:1}
+.messages{flex:1;overflow-y:auto;padding:18px;display:flex;flex-direction:column;gap:10px}
+.msg{max-width:70%;padding:10px;border-radius:12px;position:relative;animation:pop .12s forwards}
+.msg.me{align-self:flex-end;background:linear-gradient(90deg,#00e6a8,#00bfa5);color:#001}
+.msg.other{align-self:flex-start;background:rgba(255,255,255,0.04)}
+.msg .meta{font-size:11px;color:rgba(255,255,255,0.5);margin-bottom:6px}
+@keyframes pop{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.composer{display:flex;gap:8px;padding:12px;background:rgba(0,0,0,0.03);align-items:center}
+.composer input{flex:1;padding:10px;border-radius:20px;border:1px solid rgba(255,255,255,0.04);background:rgba(0,0,0,0.2);color:var(--muted)}
+.composer button{padding:8px 12px;border-radius:10px;border:none;background:var(--accent);color:#001;cursor:pointer}
+CSS
+
+# public/app.js (client logic: channels, socket, history, file, record)
+cat > "$PUBLIC_DIR/app.js" <<'JS'
+const socket = io()
+let currentChannel = 'general'
+let me = localStorage.getItem('vega_user') || ('u_'+Date.now())
+localStorage.setItem('vega_user', me)
+
+// UI elements
+const channelsDiv = document.getElementById('channels')
+const messagesDiv = document.getElementById('messages')
+const msgInput = document.getElementById('msgInput')
+const sendBtn = document.getElementById('sendBtn')
+const newChannelBtn = document.getElementById('newChannelBtn')
+const attachBtn = document.getElementById('attachBtn')
+const fileInput = document.getElementById('fileInput')
+const recordBtn = document.getElementById('recordBtn')
+const aiBtn = document.getElementById('aiBtn')
+
+// load channels
+async function loadChannels(){
+  const res = await fetch('/api/channels')
+  const list = await res.json()
+  channelsDiv.innerHTML = ''
+  list.forEach(ch => {
+    const el = document.createElement('div'); el.className='chan'; el.textContent = '# '+ch
+    el.onclick = ()=> joinChannel(ch)
+    channelsDiv.appendChild(el)
+  })
+}
+loadChannels()
+
+// join channel
+function clearMessages(){ messagesDiv.innerHTML = '' }
+function appendMessage(m){
+  const d = document.createElement('div'); d.className = 'msg ' + (m.from===me ? 'me' : 'other')
+  const meta = `<div class="meta">${m.from} • ${new Date(m.createdAt).toLocaleTimeString()}</div>`
+  let content = ''
+  if(m.type==='image') content = `<img src="${m.text}" style="max-width:220px;border-radius:8px" />`
+  else if(m.type==='audio') content = `<audio controls src="${m.text}"></audio>`
+  else if(m.type==='file') content = `<a href="${m.text}" target="_blank">📎 Archivo</a>`
+  else content = `<div class="bubble">${escapeHtml(m.text)}</div>`
+  d.innerHTML = meta + content
+  messagesDiv.appendChild(d); messagesDiv.scrollTop = messagesDiv.scrollHeight
+}
+function escapeHtml(t){ return String(t).replace(/[&<>"']/g, c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])) }
+
+async function joinChannel(ch){
+  currentChannel = ch
+  clearMessages()
+  socket.emit('join', ch)
+}
+socket.on('history', ({ channel, history })=>{
+  if(channel===currentChannel){
+    clearMessages()
+    history.forEach(m=>appendMessage(m))
+  }
+})
+socket.on('message', (m)=>{
+  if(m.channel===currentChannel) appendMessage(m)
+})
+
+// send message via REST + socket fallback
+async function sendMessage(text, file=null){
+  const fd = new FormData()
+  fd.append('from', me)
+  fd.append('text', text)
+  if(file) fd.append('file', file)
+  const res = await fetch(`/api/channels/${currentChannel}/messages`, { method:'POST', body: fd })
+  const j = await res.json()
+  // server emits via socket; UI will receive via socket
+}
+
+// UI events
+sendBtn.addEventListener('click', ()=> {
+  const t = msgInput.value.trim()
+  if(!t) return
+  sendMessage(t)
+  msgInput.value = ''
+})
+msgInput.addEventListener('keypress', e=> { if(e.key==='Enter') sendBtn.click() })
+
+newChannelBtn.addEventListener('click', async ()=>{
+  const name = prompt('Nombre del nuevo canal:')
+  if(!name) return
+  await fetch('/api/channels', { method:'POST', headers:{ 'content-type':'application/json' }, body: JSON.stringify({ name }) })
+  await loadChannels()
+})
+
+attachBtn.addEventListener('click', ()=> fileInput.click())
+fileInput.addEventListener('change', async (e)=>{
+  const f = e.target.files[0]; if(!f) return
+  await sendMessage('', f)
+})
+
+// Recording audio (MediaRecorder)
+let recorder, chunks = []
+recordBtn.addEventListener('click', async ()=>{
+  if(!recorder || recorder.state === 'inactive'){
+    const stream = await navigator.mediaDevices.getUserMedia({ audio:true })
+    recorder = new MediaRecorder(stream)
+    chunks = []
+    recorder.ondataavailable = e => { if(e.data.size) chunks.push(e.data) }
+    recorder.onstop = async ()=>{
+      const blob = new Blob(chunks, { type:'audio/webm' })
+      await sendMessage('', blob)
+    }
+    recorder.start()
+    recordBtn.textContent = '■ Detener'
+  } else {
+    recorder.stop()
+    recordBtn.textContent = '🎤'
+  }
+})
+
+// Vega AI quick DM: open or create a channel 'vega-ai'
+aiBtn.addEventListener('click', async ()=>{
+  const ch = 'vega-ai'
+  // ensure channel exists
+  await fetch('/api/channels', { method:'POST', headers:{ 'content-type':'application/json' }, body: JSON.stringify({ name: ch }) })
+  await loadChannels()
+  joinChannel(ch)
+  // show quick prompt to ask AI
+  const q = prompt('Pregúntale a Vega AI:')
+  if(q) {
+    // send to Gemini via backend and then post AI reply to channel
+    const r = await fetch('/api/gemini', { method:'POST', headers:{ 'content-type':'application/json' }, body: JSON.stringify({ message: q }) })
+    const j = await r.json()
+    // push AI reply into channel via server-side saving
+    await fetch(`/api/channels/${ch}/messages`, { method:'POST', headers:{ }, body: (()=>{ const fd=new FormData(); fd.append('from','Vega AI'); fd.append('text', j.reply); return fd })() })
+  }
+})
+
+// start in general
+joinChannel('general')
+JS
+
+# nodemon.json to avoid restart loop
+cat > nodemon.json <<'JSON'
+{
+  "watch": ["server.js", "db.js", "public"],
+  "ignore": ["db.json", ".env", "uploads"],
+  "ext": "js,json"
+}
+JSON
+
+# run.sh convenience
+cat > run.sh <<'SH'
+#!/data/data/com.termux/files/usr/bin/bash
+cd "$(dirname "$0")"
+npx nodemon server.js
+SH
+chmod +x run.sh
+
+echo "✅ logger creado en $APP_DIR"
+echo ""
+echo "Siguientes pasos:"
+echo "1) Edita .env y pega tu GEMINI_API_KEY:"
+echo "   nano $APP_DIR/.env"
+echo "2) Da permisos al script logger si aún no lo hiciste:"
+echo "   chmod +x $APP_DIR/logger"
+echo "3) Ejecuta el servidor:"
+echo "   cd $APP_DIR && ./run.sh"
+echo "4) Abre en el navegador: http://localhost:4000"
+echo ""
+echo "Notas:"
+echo "- Si quieres acceder desde otra máquina en la misma red usa la IP de tu teléfono: http://TU_IP:4000"
+echo "- Para llamadas de voz en tiempo real necesitarás TURN/STUN; el script ofrece subida y Jitsi/links como fallback si lo deseas."
+echo ""
+echo "Listo — el script 'logger' ya está en $APP_DIR/logger"
